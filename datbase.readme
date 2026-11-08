@@ -1,0 +1,906 @@
+# AgroConnect Ghana — PHP and MySQL Full-Stack Guide
+
+This guide explains how to grow the current browser-only AgroConnect prototype into a PHP and MySQL application. It includes a MySQL starter schema, registration/login flow, coverage for the existing screens, payment/revenue workflows, and a suggested project structure.
+
+> **Important:** The current HTML/CSS/JavaScript prototype does not connect to PHP, MySQL, or a real payment provider. Its business demo data is stored in browser `localStorage`. This guide is an implementation blueprint, not a live backend. Do not collect real user information or money until the server, security controls, database, and provider integration are implemented and tested.
+
+## 1. Recommended stack and rules
+
+- **Database:** MySQL 8.0.16 or newer, using InnoDB and strict SQL mode. MySQL 8.0.16 is the minimum here because earlier releases did not enforce `CHECK` constraints.
+- **Backend:** PHP 8.2+ with PDO MySQL, prepared statements, Composer for dependencies, and a routing pattern/framework such as Laravel or Symfony. Plain PHP can work, but still use a router, controllers, services, validation, and migrations.
+- **Frontend:** the current HTML/CSS/JavaScript can call PHP JSON endpoints with `fetch()`. A JavaScript framework is optional.
+- **Migrations:** use versioned migration files and a migration tool (for example, Phinx or the framework's migration system). Do not rely on manually editing production tables.
+- **IDs:** the schema uses `CHAR(36)` UUIDs. Generate UUIDs in PHP and supply them when inserting rows.
+- **Money:** use `DECIMAL`, never `FLOAT`/`DOUBLE`, for GHS values. Snapshot the commission rate and amount on each transaction.
+- **Security:** hash passwords in PHP with `password_hash()` and verify with `password_verify()`. Use PDO prepared statements, server-side role/ownership checks, CSRF protection for cookie-authenticated writes, and secure HTTPS cookies.
+- **Payments:** use a payment provider approved for the intended Ghanaian payment methods. Never store mobile-money PINs, card numbers, CVVs, or bank credentials. Keep provider secrets on the server.
+- **Auditability:** ledger entries should be append-only through the application; make corrections with explicit refund/adjustment records, not by silently editing history.
+
+## 2. Initial MySQL schema
+
+Save this as `database/migrations/001_initial_schema.sql` and apply it first to a development database. The tables use InnoDB so foreign keys and transactions work. IDs are supplied by PHP. Bind values from PHP with PDO placeholders (`?` or named placeholders); never concatenate user input into SQL.
+
+```sql
+CREATE DATABASE IF NOT EXISTS agroconnect
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE agroconnect;
+
+CREATE TABLE users (
+    id                CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    email             VARCHAR(254) NOT NULL,
+    email_normalized  VARCHAR(254) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    phone             VARCHAR(32) NULL,
+    password_hash     VARCHAR(255) NOT NULL,
+    full_name         VARCHAR(160) NOT NULL,
+    status            VARCHAR(32) NOT NULL DEFAULT 'active',
+    email_verified_at DATETIME(6) NULL,
+    phone_verified_at DATETIME(6) NULL,
+    created_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                      ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY users_email_normalized_uq (email_normalized),
+    UNIQUE KEY users_phone_uq (phone),
+    CONSTRAINT users_status_chk CHECK
+      (status IN ('active', 'pending_verification', 'suspended', 'deleted'))
+) ENGINE=InnoDB;
+
+CREATE TABLE user_roles (
+    user_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    role       VARCHAR(32) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (user_id, role),
+    CONSTRAINT user_roles_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT user_roles_role_chk CHECK
+      (role IN ('farmer', 'buyer', 'organisation', 'transport', 'admin'))
+) ENGINE=InnoDB;
+
+-- Store only hashes of random, revocable session/refresh tokens.
+CREATE TABLE auth_sessions (
+    id         CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    user_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    expires_at DATETIME(6) NOT NULL,
+    revoked_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY auth_sessions_token_hash_uq (token_hash),
+    KEY auth_sessions_user_active_idx (user_id, revoked_at, expires_at),
+    CONSTRAINT auth_sessions_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE auth_tokens (
+    id         CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    user_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    purpose    VARCHAR(32) NOT NULL,
+    expires_at DATETIME(6) NOT NULL,
+    used_at    DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY auth_tokens_hash_uq (token_hash),
+    KEY auth_tokens_user_purpose_idx (user_id, purpose, expires_at),
+    CONSTRAINT auth_tokens_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT auth_tokens_purpose_chk CHECK
+      (purpose IN ('verify_email', 'verify_phone', 'reset_password'))
+) ENGINE=InnoDB;
+
+CREATE TABLE farmer_profiles (
+    user_id         CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    region          VARCHAR(100) NOT NULL,
+    district        VARCHAR(100) NULL,
+    community       VARCHAR(120) NULL,
+    farm_size_acres DECIMAL(10,2) NULL,
+    farming_type    VARCHAR(100) NULL,
+    bio             TEXT NULL,
+    photo_url       VARCHAR(2048) NULL,
+    is_public       BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT farmer_profiles_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT farmer_profiles_size_chk CHECK
+      (farm_size_acres IS NULL OR farm_size_acres >= 0)
+) ENGINE=InnoDB;
+
+CREATE TABLE buyer_profiles (
+    user_id       CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    business_name VARCHAR(180) NOT NULL,
+    region        VARCHAR(100) NULL,
+    district      VARCHAR(100) NULL,
+    bio           TEXT NULL,
+    logo_url      VARCHAR(2048) NULL,
+    CONSTRAINT buyer_profiles_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE organisation_profiles (
+    user_id           CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    organisation_name VARCHAR(180) NOT NULL,
+    organisation_type VARCHAR(120) NOT NULL,
+    region            VARCHAR(100) NULL,
+    website_url       VARCHAR(2048) NULL,
+    description       TEXT NULL,
+    CONSTRAINT organisation_profiles_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE transport_profiles (
+    user_id           CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    business_name     VARCHAR(180) NOT NULL,
+    vehicle_type      VARCHAR(100) NOT NULL,
+    operating_regions JSON NOT NULL,
+    verified_at       DATETIME(6) NULL,
+    rating            DECIMAL(3,2) NULL,
+    CONSTRAINT transport_profiles_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT transport_profiles_rating_chk CHECK
+      (rating IS NULL OR rating BETWEEN 0 AND 5)
+) ENGINE=InnoDB;
+
+CREATE TABLE produce_categories (
+    id   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(120) NOT NULL,
+    UNIQUE KEY produce_categories_name_uq (name),
+    UNIQUE KEY produce_categories_slug_uq (slug)
+) ENGINE=InnoDB;
+
+CREATE TABLE produce_listings (
+    id               CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    farmer_user_id   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    category_id      CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    title            VARCHAR(180) NOT NULL,
+    description      TEXT NULL,
+    quantity         DECIMAL(12,2) NOT NULL,
+    quantity_unit    VARCHAR(40) NOT NULL DEFAULT 'tonne',
+    price_per_unit   DECIMAL(12,2) NOT NULL,
+    currency         CHAR(3) NOT NULL DEFAULT 'GHS',
+    region           VARCHAR(100) NOT NULL,
+    district         VARCHAR(100) NULL,
+    availability_date DATE NULL,
+    status           VARCHAR(32) NOT NULL DEFAULT 'draft',
+    image_url        VARCHAR(2048) NULL,
+    created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                     ON UPDATE CURRENT_TIMESTAMP(6),
+    KEY listings_search_idx (status, category_id, region),
+    KEY listings_farmer_idx (farmer_user_id, created_at),
+    CONSTRAINT listings_farmer_fk FOREIGN KEY (farmer_user_id)
+      REFERENCES farmer_profiles(user_id),
+    CONSTRAINT listings_category_fk FOREIGN KEY (category_id)
+      REFERENCES produce_categories(id),
+    CONSTRAINT listings_quantity_chk CHECK (quantity > 0),
+    CONSTRAINT listings_price_chk CHECK (price_per_unit >= 0),
+    CONSTRAINT listings_currency_chk CHECK (currency = 'GHS'),
+    CONSTRAINT listings_status_chk CHECK
+      (status IN ('draft', 'pending_review', 'active', 'sold_out', 'rejected', 'archived'))
+) ENGINE=InnoDB;
+
+CREATE TABLE market_prices (
+    id          CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    category_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    market_name VARCHAR(140) NOT NULL,
+    region      VARCHAR(100) NOT NULL,
+    price       DECIMAL(12,2) NOT NULL,
+    price_unit  VARCHAR(80) NOT NULL,
+    currency    CHAR(3) NOT NULL DEFAULT 'GHS',
+    observed_on DATE NOT NULL,
+    source_name VARCHAR(180) NULL,
+    created_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY market_price_snapshot_uq (category_id, market_name, price_unit, observed_on),
+    KEY market_prices_lookup_idx (category_id, region, observed_on),
+    CONSTRAINT market_prices_category_fk FOREIGN KEY (category_id)
+      REFERENCES produce_categories(id),
+    CONSTRAINT market_prices_price_chk CHECK (price >= 0),
+    CONSTRAINT market_prices_currency_chk CHECK (currency = 'GHS')
+) ENGINE=InnoDB;
+
+CREATE TABLE buyer_requirements (
+    id              CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    buyer_user_id   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    category_id     CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    title           VARCHAR(180) NOT NULL,
+    quantity        DECIMAL(12,2) NOT NULL,
+    quantity_unit   VARCHAR(40) NOT NULL DEFAULT 'tonne',
+    region          VARCHAR(100) NOT NULL,
+    needed_by       DATE NULL,
+    quality_notes   TEXT NULL,
+    budget_per_unit DECIMAL(12,2) NULL,
+    status          VARCHAR(24) NOT NULL DEFAULT 'open',
+    created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY requirements_search_idx (status, category_id, region),
+    CONSTRAINT requirements_buyer_fk FOREIGN KEY (buyer_user_id)
+      REFERENCES buyer_profiles(user_id),
+    CONSTRAINT requirements_category_fk FOREIGN KEY (category_id)
+      REFERENCES produce_categories(id),
+    CONSTRAINT requirements_quantity_chk CHECK (quantity > 0),
+    CONSTRAINT requirements_budget_chk CHECK
+      (budget_per_unit IS NULL OR budget_per_unit >= 0),
+    CONSTRAINT requirements_status_chk CHECK
+      (status IN ('draft', 'open', 'matched', 'closed'))
+) ENGINE=InnoDB;
+
+CREATE TABLE farmer_enquiries (
+    id            CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    listing_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    buyer_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    message       TEXT NOT NULL,
+    status        VARCHAR(24) NOT NULL DEFAULT 'new',
+    created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY enquiries_listing_idx (listing_id, created_at),
+    KEY enquiries_buyer_idx (buyer_user_id, created_at),
+    CONSTRAINT enquiries_listing_fk FOREIGN KEY (listing_id)
+      REFERENCES produce_listings(id),
+    CONSTRAINT enquiries_buyer_fk FOREIGN KEY (buyer_user_id)
+      REFERENCES buyer_profiles(user_id),
+    CONSTRAINT enquiries_status_chk CHECK
+      (status IN ('new', 'responded', 'closed', 'withdrawn'))
+) ENGINE=InnoDB;
+
+CREATE TABLE opportunities (
+    id                   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    organisation_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    title                VARCHAR(180) NOT NULL,
+    category             VARCHAR(100) NOT NULL,
+    region               VARCHAR(100) NULL,
+    description          TEXT NOT NULL,
+    eligibility          TEXT NULL,
+    benefit              TEXT NULL,
+    deadline             DATE NULL,
+    status               VARCHAR(24) NOT NULL DEFAULT 'pending_review',
+    created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT opportunities_org_fk FOREIGN KEY (organisation_user_id)
+      REFERENCES organisation_profiles(user_id),
+    CONSTRAINT opportunities_status_chk CHECK
+      (status IN ('draft', 'pending_review', 'published', 'closed', 'rejected'))
+) ENGINE=InnoDB;
+
+CREATE TABLE opportunity_applications (
+    id             CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    opportunity_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    farmer_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    message        TEXT NULL,
+    status         VARCHAR(24) NOT NULL DEFAULT 'submitted',
+    created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY opportunity_application_once_uq (opportunity_id, farmer_user_id),
+    CONSTRAINT applications_opportunity_fk FOREIGN KEY (opportunity_id)
+      REFERENCES opportunities(id),
+    CONSTRAINT applications_farmer_fk FOREIGN KEY (farmer_user_id)
+      REFERENCES farmer_profiles(user_id),
+    CONSTRAINT applications_status_chk CHECK
+      (status IN ('submitted', 'under_review', 'accepted', 'rejected', 'withdrawn'))
+) ENGINE=InnoDB;
+
+CREATE TABLE saved_farmers (
+    buyer_user_id  CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    farmer_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (buyer_user_id, farmer_user_id),
+    CONSTRAINT saved_farmers_buyer_fk FOREIGN KEY (buyer_user_id)
+      REFERENCES buyer_profiles(user_id) ON DELETE CASCADE,
+    CONSTRAINT saved_farmers_farmer_fk FOREIGN KEY (farmer_user_id)
+      REFERENCES farmer_profiles(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE saved_opportunities (
+    farmer_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    opportunity_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (farmer_user_id, opportunity_id),
+    CONSTRAINT saved_opportunities_farmer_fk FOREIGN KEY (farmer_user_id)
+      REFERENCES farmer_profiles(user_id) ON DELETE CASCADE,
+    CONSTRAINT saved_opportunities_opportunity_fk FOREIGN KEY (opportunity_id)
+      REFERENCES opportunities(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE subscription_plans (
+    id           CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    audience     VARCHAR(16) NOT NULL,
+    name         VARCHAR(80) NOT NULL,
+    monthly_price DECIMAL(12,2) NOT NULL,
+    currency     CHAR(3) NOT NULL DEFAULT 'GHS',
+    features     JSON NOT NULL,
+    is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE KEY subscription_plan_name_uq (audience, name),
+    CONSTRAINT plans_audience_chk CHECK (audience IN ('farmer', 'buyer')),
+    CONSTRAINT plans_price_chk CHECK (monthly_price >= 0),
+    CONSTRAINT plans_currency_chk CHECK (currency = 'GHS')
+) ENGINE=InnoDB;
+
+CREATE TABLE subscriptions (
+    id                   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    user_id              CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    plan_id              CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    status               VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
+    price_at_signup      DECIMAL(12,2) NOT NULL,
+    currency             CHAR(3) NOT NULL DEFAULT 'GHS',
+    started_at           DATETIME(6) NULL,
+    current_period_start DATETIME(6) NULL,
+    current_period_end   DATETIME(6) NULL,
+    cancelled_at         DATETIME(6) NULL,
+    created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY subscriptions_user_status_idx (user_id, status),
+    CONSTRAINT subscriptions_user_fk FOREIGN KEY (user_id) REFERENCES users(id),
+    CONSTRAINT subscriptions_plan_fk FOREIGN KEY (plan_id) REFERENCES subscription_plans(id),
+    CONSTRAINT subscriptions_price_chk CHECK (price_at_signup >= 0),
+    CONSTRAINT subscriptions_status_chk CHECK
+      (status IN ('pending_payment', 'active', 'past_due', 'cancelled', 'expired', 'replaced'))
+) ENGINE=InnoDB;
+
+CREATE TABLE produce_transactions (
+    id                CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    listing_id        CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    buyer_user_id     CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    farmer_user_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    quantity          DECIMAL(12,2) NOT NULL,
+    unit_price        DECIMAL(12,2) NOT NULL,
+    gross_amount      DECIMAL(12,2) NOT NULL,
+    commission_rate   DECIMAL(5,2) NOT NULL,
+    commission_amount DECIMAL(12,2) NOT NULL,
+    farmer_payable    DECIMAL(12,2) NOT NULL,
+    currency          CHAR(3) NOT NULL DEFAULT 'GHS',
+    status            VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
+    created_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY transactions_buyer_idx (buyer_user_id, created_at),
+    KEY transactions_farmer_idx (farmer_user_id, created_at),
+    CONSTRAINT transactions_listing_fk FOREIGN KEY (listing_id) REFERENCES produce_listings(id),
+    CONSTRAINT transactions_buyer_fk FOREIGN KEY (buyer_user_id) REFERENCES buyer_profiles(user_id),
+    CONSTRAINT transactions_farmer_fk FOREIGN KEY (farmer_user_id) REFERENCES farmer_profiles(user_id),
+    CONSTRAINT transactions_quantity_chk CHECK (quantity > 0),
+    CONSTRAINT transactions_amounts_chk CHECK
+      (unit_price >= 0 AND gross_amount >= 0 AND commission_amount >= 0 AND farmer_payable >= 0),
+    CONSTRAINT transactions_commission_chk CHECK (commission_rate BETWEEN 0 AND 100),
+    CONSTRAINT transactions_split_chk CHECK (gross_amount = commission_amount + farmer_payable),
+    CONSTRAINT transactions_currency_chk CHECK (currency = 'GHS'),
+    CONSTRAINT transactions_status_chk CHECK
+      (status IN ('pending_payment', 'paid', 'fulfilled', 'cancelled', 'refunded', 'failed'))
+) ENGINE=InnoDB;
+
+CREATE TABLE advertising_campaigns (
+    id            CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    owner_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    title         VARCHAR(180) NOT NULL,
+    package_name  VARCHAR(100) NOT NULL,
+    amount        DECIMAL(12,2) NOT NULL,
+    currency      CHAR(3) NOT NULL DEFAULT 'GHS',
+    duration_days INT NOT NULL,
+    status        VARCHAR(24) NOT NULL DEFAULT 'pending_payment',
+    impressions   BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    clicks        BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    starts_at     DATETIME(6) NULL,
+    ends_at       DATETIME(6) NULL,
+    created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT campaigns_owner_fk FOREIGN KEY (owner_user_id) REFERENCES users(id),
+    CONSTRAINT campaigns_amount_chk CHECK (amount >= 0 AND duration_days > 0),
+    CONSTRAINT campaigns_currency_chk CHECK (currency = 'GHS'),
+    CONSTRAINT campaigns_status_chk CHECK
+      (status IN ('pending_payment', 'pending_approval', 'active', 'paused', 'rejected', 'completed'))
+) ENGINE=InnoDB;
+
+CREATE TABLE campaign_events (
+    id          CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    campaign_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    event_type  VARCHAR(16) NOT NULL,
+    occurred_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY campaign_events_lookup_idx (campaign_id, occurred_at),
+    CONSTRAINT campaign_events_campaign_fk FOREIGN KEY (campaign_id)
+      REFERENCES advertising_campaigns(id) ON DELETE CASCADE,
+    CONSTRAINT campaign_events_type_chk CHECK (event_type IN ('impression', 'click'))
+) ENGINE=InnoDB;
+
+CREATE TABLE partnership_applications (
+    id                   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    organisation_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    service_name         VARCHAR(140) NOT NULL,
+    contact_name         VARCHAR(160) NOT NULL,
+    contact_email        VARCHAR(254) NOT NULL,
+    contact_phone        VARCHAR(32) NOT NULL,
+    audience             VARCHAR(200) NOT NULL,
+    duration_days        INT NOT NULL,
+    proposed_budget      DECIMAL(12,2) NOT NULL,
+    description          TEXT NOT NULL,
+    status               VARCHAR(24) NOT NULL DEFAULT 'submitted',
+    created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT partnerships_org_fk FOREIGN KEY (organisation_user_id)
+      REFERENCES organisation_profiles(user_id),
+    CONSTRAINT partnerships_amount_chk CHECK (duration_days > 0 AND proposed_budget >= 0),
+    CONSTRAINT partnerships_status_chk CHECK
+      (status IN ('submitted', 'pending_payment', 'pending_review', 'approved', 'rejected', 'completed'))
+) ENGINE=InnoDB;
+
+CREATE TABLE logistics_requests (
+    id                 CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    buyer_user_id      CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    farmer_user_id     CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    produce_name       VARCHAR(140) NOT NULL,
+    quantity           DECIMAL(12,2) NOT NULL,
+    quantity_unit      VARCHAR(40) NOT NULL DEFAULT 'tonne',
+    pickup_location    VARCHAR(180) NOT NULL,
+    delivery_location  VARCHAR(180) NOT NULL,
+    vehicle_type       VARCHAR(100) NOT NULL,
+    estimated_cost     DECIMAL(12,2) NOT NULL,
+    quoted_cost        DECIMAL(12,2) NULL,
+    commission_rate    DECIMAL(5,2) NOT NULL,
+    commission_amount  DECIMAL(12,2) NULL,
+    operator_user_id   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    status             VARCHAR(32) NOT NULL DEFAULT 'request_submitted',
+    requested_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    delivered_at       DATETIME(6) NULL,
+    completed_at       DATETIME(6) NULL,
+    KEY logistics_operator_status_idx (operator_user_id, status),
+    KEY logistics_buyer_idx (buyer_user_id, requested_at),
+    CONSTRAINT logistics_buyer_fk FOREIGN KEY (buyer_user_id) REFERENCES buyer_profiles(user_id),
+    CONSTRAINT logistics_farmer_fk FOREIGN KEY (farmer_user_id) REFERENCES farmer_profiles(user_id),
+    CONSTRAINT logistics_operator_fk FOREIGN KEY (operator_user_id) REFERENCES transport_profiles(user_id),
+    CONSTRAINT logistics_quantity_chk CHECK (quantity > 0),
+    CONSTRAINT logistics_cost_chk CHECK
+      (estimated_cost >= 0 AND (quoted_cost IS NULL OR quoted_cost >= 0)),
+    CONSTRAINT logistics_commission_chk CHECK
+      (commission_rate BETWEEN 0 AND 100 AND (commission_amount IS NULL OR commission_amount >= 0)),
+    CONSTRAINT logistics_status_chk CHECK
+      (status IN ('request_submitted', 'quotation_received', 'transport_assigned',
+                  'pickup_in_progress', 'in_transit', 'delivered', 'completed', 'cancelled', 'disputed'))
+) ENGINE=InnoDB;
+
+-- Every payment belongs to exactly one business record. Keep a unique
+-- idempotency key and the provider reference to handle retries/webhooks safely.
+CREATE TABLE payments (
+    id                   CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    transaction_id       CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    subscription_id      CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    campaign_id          CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    partnership_id       CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    logistics_request_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    provider             VARCHAR(80) NOT NULL,
+    provider_reference   VARCHAR(190) NULL,
+    idempotency_key      VARCHAR(120) NOT NULL,
+    payment_type         VARCHAR(24) NOT NULL DEFAULT 'collection',
+    amount               DECIMAL(12,2) NOT NULL,
+    currency             CHAR(3) NOT NULL DEFAULT 'GHS',
+    status               VARCHAR(16) NOT NULL DEFAULT 'pending',
+    payment_method       VARCHAR(80) NULL,
+    failure_code         VARCHAR(120) NULL,
+    created_at           DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    paid_at              DATETIME(6) NULL,
+    UNIQUE KEY payments_idempotency_uq (idempotency_key),
+    UNIQUE KEY payments_provider_reference_uq (provider, provider_reference),
+    KEY payments_status_created_idx (status, created_at),
+    CONSTRAINT payments_transaction_fk FOREIGN KEY (transaction_id) REFERENCES produce_transactions(id),
+    CONSTRAINT payments_subscription_fk FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+    CONSTRAINT payments_campaign_fk FOREIGN KEY (campaign_id) REFERENCES advertising_campaigns(id),
+    CONSTRAINT payments_partnership_fk FOREIGN KEY (partnership_id) REFERENCES partnership_applications(id),
+    CONSTRAINT payments_logistics_fk FOREIGN KEY (logistics_request_id) REFERENCES logistics_requests(id),
+    CONSTRAINT payments_one_source_chk CHECK
+      ((transaction_id IS NOT NULL) + (subscription_id IS NOT NULL) + (campaign_id IS NOT NULL)
+       + (partnership_id IS NOT NULL) + (logistics_request_id IS NOT NULL) = 1),
+    CONSTRAINT payments_amount_chk CHECK (amount >= 0),
+    CONSTRAINT payments_type_chk CHECK
+      (payment_type IN ('collection', 'carrier_payout', 'refund')),
+    CONSTRAINT payments_currency_chk CHECK (currency = 'GHS'),
+    CONSTRAINT payments_status_chk CHECK (status IN ('pending', 'succeeded', 'failed', 'refunded'))
+) ENGINE=InnoDB;
+
+-- Revenue here is only paid platform income, never the gross produce order
+-- value or the whole carrier fare. Write entries atomically with payment state.
+CREATE TABLE revenue_ledger (
+    id               CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    payment_id       CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    source_type      VARCHAR(32) NOT NULL,
+    source_id        CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    customer_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    amount           DECIMAL(12,2) NOT NULL,
+    currency         CHAR(3) NOT NULL DEFAULT 'GHS',
+    description      VARCHAR(500) NOT NULL,
+    created_at       DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY revenue_payment_source_uq (payment_id, source_type),
+    UNIQUE KEY revenue_source_once_uq (source_type, source_id),
+    KEY revenue_created_idx (created_at),
+    KEY revenue_source_idx (source_type, created_at),
+    CONSTRAINT revenue_payment_fk FOREIGN KEY (payment_id) REFERENCES payments(id),
+    CONSTRAINT revenue_customer_fk FOREIGN KEY (customer_user_id) REFERENCES users(id),
+    CONSTRAINT revenue_source_chk CHECK
+      (source_type IN ('produce_commission', 'farmer_subscription', 'buyer_subscription',
+                       'advertising', 'partnership', 'logistics_commission', 'adjustment', 'refund')),
+    CONSTRAINT revenue_currency_chk CHECK (currency = 'GHS')
+) ENGINE=InnoDB;
+
+CREATE TABLE platform_settings (
+    setting_key VARCHAR(120) PRIMARY KEY,
+    setting_value JSON NOT NULL,
+    updated_by CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+               ON UPDATE CURRENT_TIMESTAMP(6),
+    CONSTRAINT settings_user_fk FOREIGN KEY (updated_by) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE notifications (
+    id         CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    user_id    CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    title      VARCHAR(180) NOT NULL,
+    message    TEXT NOT NULL,
+    read_at    DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY notifications_user_created_idx (user_id, created_at),
+    CONSTRAINT notifications_user_fk FOREIGN KEY (user_id)
+      REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE audit_logs (
+    id            CHAR(36) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    actor_user_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    action        VARCHAR(120) NOT NULL,
+    entity_type   VARCHAR(100) NOT NULL,
+    entity_id     CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    details       JSON NOT NULL,
+    created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY audit_entity_idx (entity_type, entity_id, created_at),
+    CONSTRAINT audit_actor_fk FOREIGN KEY (actor_user_id) REFERENCES users(id)
+) ENGINE=InnoDB;
+```
+
+### Development seed data
+
+Generate IDs in PHP before inserting rows, or use fixed UUIDs for local-only seed scripts. These are sample plan values, not a pricing recommendation. Never seed the demo farmer names or fake transaction history as real production customers.
+
+```sql
+INSERT INTO produce_categories (id, name, slug) VALUES
+  ('00000000-0000-4000-8000-000000000001', 'Tomatoes', 'tomatoes'),
+  ('00000000-0000-4000-8000-000000000002', 'Maize', 'maize'),
+  ('00000000-0000-4000-8000-000000000003', 'Cassava', 'cassava'),
+  ('00000000-0000-4000-8000-000000000004', 'Plantain', 'plantain'),
+  ('00000000-0000-4000-8000-000000000005', 'Pepper', 'pepper'),
+  ('00000000-0000-4000-8000-000000000006', 'Rice', 'rice'),
+  ('00000000-0000-4000-8000-000000000007', 'Yam', 'yam'),
+  ('00000000-0000-4000-8000-000000000008', 'Pineapple', 'pineapple');
+
+INSERT INTO subscription_plans (id, audience, name, monthly_price, features) VALUES
+  ('10000000-0000-4000-8000-000000000001', 'farmer', 'Free', 0, JSON_ARRAY('Basic profile', 'Up to 3 listings')),
+  ('10000000-0000-4000-8000-000000000002', 'farmer', 'Basic', 20, JSON_ARRAY('Up to 10 listings', 'Sales analytics')),
+  ('10000000-0000-4000-8000-000000000003', 'farmer', 'Professional', 50, JSON_ARRAY('Priority placement', 'Advanced analytics')),
+  ('10000000-0000-4000-8000-000000000004', 'farmer', 'Agribusiness', 100, JSON_ARRAY('Multiple locations', 'Advanced reports')),
+  ('10000000-0000-4000-8000-000000000005', 'buyer', 'Starter', 100, JSON_ARRAY('Buyer profile', 'Basic procurement')),
+  ('10000000-0000-4000-8000-000000000006', 'buyer', 'Business', 250, JSON_ARRAY('Supplier comparison', 'Priority support')),
+  ('10000000-0000-4000-8000-000000000007', 'buyer', 'Enterprise', 500, JSON_ARRAY('Bulk matching', 'Downloadable reports'));
+
+INSERT INTO platform_settings (setting_key, setting_value) VALUES
+  ('transaction_commission_percent', CAST('3' AS JSON)),
+  ('logistics_commission_percent', CAST('10' AS JSON));
+```
+
+## 3. Registration and login in PHP
+
+### Registration
+
+1. Validate and normalize all fields on the server. Set `$emailNormalized = mb_strtolower(trim($email), 'UTF-8')`.
+2. Hash the password in PHP with `password_hash()`. Use `PASSWORD_ARGON2ID` when available and configured; otherwise use `PASSWORD_DEFAULT`. Never store the submitted password.
+3. Generate a UUID in PHP. In one PDO transaction, insert the `users` row, `user_roles` row, and exactly one matching profile row.
+4. Allow only public roles (`farmer`, `buyer`, `organisation`, `transport`) in signup. Do not accept `admin` from the registration form.
+5. On a database uniqueness error, return a helpful but safe message. Do not reveal whether someone else's account is registered beyond what your product's privacy policy permits.
+
+Example pattern (the input validation and profile fields must match the registration form):
+
+```php
+<?php
+function uuidV4(): string
+{
+    $bytes = random_bytes(16);
+    $bytes[6] = chr((ord($bytes[6]) & 0x0f) | 0x40);
+    $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80);
+    $hex = bin2hex($bytes);
+    return substr($hex, 0, 8) . '-' . substr($hex, 8, 4) . '-' .
+        substr($hex, 12, 4) . '-' . substr($hex, 16, 4) . '-' . substr($hex, 20);
+}
+
+$allowedRoles = ['farmer', 'buyer', 'organisation', 'transport'];
+$role = (string) $input['role'];
+if (!in_array($role, $allowedRoles, true)) {
+    throw new InvalidArgumentException('Unsupported account type.');
+}
+
+$userId = uuidV4();
+$email = trim((string) $input['email']);
+$emailNormalized = mb_strtolower($email, 'UTF-8');
+$passwordAlgorithm = defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT;
+$passwordHash = password_hash((string) $input['password'], $passwordAlgorithm);
+
+$pdo->beginTransaction();
+try {
+    $stmt = $pdo->prepare(
+        'INSERT INTO users (id, email, email_normalized, phone, password_hash, full_name, status)
+         VALUES (:id, :email, :email_normalized, :phone, :password_hash, :full_name, :status)'
+    );
+    $stmt->execute([
+        'id' => $userId,
+        'email' => $email,
+        'email_normalized' => $emailNormalized,
+        'phone' => $input['phone'] ?? null,
+        'password_hash' => $passwordHash,
+        'full_name' => trim((string) $input['name']),
+        'status' => 'pending_verification',
+    ]);
+
+    $roleStmt = $pdo->prepare('INSERT INTO user_roles (user_id, role) VALUES (?, ?)');
+    $roleStmt->execute([$userId, $role]);
+
+    // Validate the role-specific fields and insert that role's profile before
+    // committing. Example farmer profile:
+    if ($role === 'farmer') {
+        $profile = $pdo->prepare(
+            'INSERT INTO farmer_profiles (user_id, region, district, community, farming_type)
+             VALUES (?, ?, ?, ?, ?)'
+        );
+        $profile->execute([
+            $userId, $input['region'], $input['district'] ?? null,
+            $input['community'] ?? null, $input['farming_type'] ?? null,
+        ]);
+    }
+    // Add equivalent explicit branches for buyer_profiles,
+    // organisation_profiles, and transport_profiles.
+    $pdo->commit();
+} catch (Throwable $error) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    throw $error;
+}
+```
+
+Complete and test equivalent explicit branches for `buyer_profiles`, `organisation_profiles`, and `transport_profiles` before enabling registration. If building dynamic SQL for a profile table, select its name only from a fixed server-side allowlist, never from request data. Values must always use PDO placeholders. Validate that the required profile row belongs to the new user and that a user cannot grant themselves another role.
+
+### Login and session
+
+1. Accept login only over HTTPS, rate-limit attempts, and use the same normalized email format used at registration.
+2. Fetch the account with a prepared query, then call `password_verify($submittedPassword, $row['password_hash'])` in PHP. Return a generic error for unknown email and wrong password.
+3. Reject suspended/deleted users and enforce the chosen verification rules.
+4. Use server-side sessions with strict cookie settings (`Secure`, `HttpOnly`, `SameSite=Lax` or stricter), regenerate the session ID after login, and protect cookie-authenticated writes against CSRF. Alternatively, store only hashes of random tokens in `auth_sessions`. Use `auth_tokens` for one-time, expiring email/phone verification and password-reset links; store a hash of each random token, never the token itself.
+5. Enforce roles and record ownership on every protected request. A role dropdown or direct dashboard URL is not authentication.
+
+```php
+$stmt = $pdo->prepare(
+    'SELECT id, password_hash, status, email_verified_at
+     FROM users WHERE email_normalized = ? LIMIT 1'
+);
+$stmt->execute([$emailNormalized]);
+$user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if (!$user || !password_verify($submittedPassword, $user['password_hash'])) {
+    throw new RuntimeException('Invalid email or password.');
+}
+if ($user['status'] !== 'active') {
+    throw new RuntimeException('This account cannot sign in.');
+}
+
+session_regenerate_id(true);
+$_SESSION['user_id'] = $user['id'];
+```
+
+## 4. Map every prototype feature to database/API work
+
+The existing page names stay in place. Example PHP routes under `/api/v1` can return JSON to the current frontend.
+
+| Existing screen / feature | Data tables | Example endpoints and rules |
+|---|---|---|
+| `index.html` homepage, carousel, summaries | `produce_listings`, `opportunities`, `produce_categories` | `GET /api/v1/home`; show only active listings and published opportunities. |
+| `marketplace.html`, produce search | `produce_listings`, `farmer_profiles`, `produce_categories`, `advertising_campaigns`, `campaign_events` | `GET /api/v1/listings`, `GET /api/v1/listings/{id}`; server-side filtering/pagination; sponsored cards must be paid, approved, active and labeled Sponsored. |
+| `farmers.html`, saved farmers | `farmer_profiles`, `users`, `produce_listings`, `saved_farmers` | `GET /api/v1/farmers`; respect `is_public`; never expose phone/email without explicit consent. Saving is buyer-only. |
+| `buyer-requirements.html`, farmer enquiries | `buyer_requirements`, `farmer_enquiries` | `GET/POST /api/v1/buyer-requirements`, `POST /api/v1/listings/{id}/enquiries`; verify role, ownership and listing status. |
+| `opportunities.html`, saved opportunities/applications | `opportunities`, `opportunity_applications`, `saved_opportunities` | Organisations submit; admins approve/publish; farmers save/apply; prevent duplicate applications. |
+| `market-prices.html` | `market_prices`, `produce_categories` | `GET /api/v1/market-prices`; filter by commodity, market, region and date; show source and observation date, and identify sample data. |
+| `register.html`, `login.html` | `users`, `user_roles`, role profile tables, `auth_sessions` or PHP sessions | `POST /api/v1/auth/register`, `/login`, `/logout`, verification and password-reset endpoints. |
+| Farmer dashboard | farmer profile, listings, orders, subscriptions, campaigns, notifications | `GET/PATCH /api/v1/me/farmer`, `POST /api/v1/listings`, `GET /api/v1/me/orders`; enforce ownership. |
+| Buyer dashboard | buyer profile, requirements, orders, logistics, subscriptions | `GET/PATCH /api/v1/me/buyer`, create requirements/orders/logistics requests; enforce buyer role. |
+| Organisation dashboard | organisation profile, opportunities, partnerships | Submit opportunities and partnership applications; only authorized admins can approve/reject. |
+| Transport dashboard | transport profile, logistics requests | Quote and progress assigned jobs; only the assigned, authorized operator can change a delivery status. |
+| Admin dashboard and settings | all business tables, `payments`, `revenue_ledger`, `platform_settings`, `audit_logs` | Admin-only review, moderation, assignment, refunds and settings; audit sensitive actions. |
+| CSV exports and analytics | `produce_transactions`, `payments`, `revenue_ledger`, subscriptions, campaign metrics | Generate server-side from authorized queries. Sum paid ledger rows for platform revenue, not gross order value. |
+| Notifications | `notifications` | Create on state changes; deliver email/SMS through a queue only with consent and provider setup. |
+
+Store images/documents in object storage or a controlled media service, not arbitrary local paths. Validate upload type/size and ownership; never trust a filename supplied by the browser.
+
+## 5. Produce purchase and commission
+
+1. Buyer chooses an active listing and quantity.
+2. PHP reloads/locks the listing inside a transaction, checks availability, calculates the total from the database price, reads the active platform commission, and stores the commission rate and split on `produce_transactions`.
+3. Create a pending `payments` record with a server-generated idempotency key; request a provider payment intent.
+4. Only after a verified provider webhook does PHP mark payment/order successful and add one platform-fee entry to `revenue_ledger`.
+5. Confirm fulfilment separately. Refund/cancellation creates explicit payment state changes and compensating ledger records.
+
+```text
+commission_amount = ROUND(gross_amount * commission_rate / 100, 2)
+farmer_payable    = gross_amount - commission_amount
+```
+
+For example, GH₵10,000 at 3% yields GH₵300 commission and GH₵9,700 payable before any separately disclosed charges. The platform commission is not the gross produce transaction amount.
+
+## 6. Payments, subscriptions, and revenue
+
+### Payment lifecycle
+
+1. PHP creates a pending payment and idempotency key; the browser never chooses the authoritative amount.
+2. PHP calls the payment provider using a secret stored on the server and returns only the checkout details required by the browser.
+3. A webhook endpoint verifies the provider signature and, when supported, checks the payment directly with the provider.
+4. Use a MySQL transaction and `SELECT ... FOR UPDATE` to lock the payment. Check its expected amount, currency, purpose, and source record; only then update status and business state.
+5. Insert one ledger row in the same transaction. The unique keys on payment and source protect against duplicate accounting entries.
+6. Never treat a browser redirect or browser-supplied `success=true` as proof of payment. Validate state transitions and check affected row counts.
+
+Illustrative SQL operations for a verified produce payment (execute using PDO on the same connection):
+
+```sql
+START TRANSACTION;
+
+SELECT id, transaction_id, amount, currency, status
+FROM payments
+WHERE id = ?
+FOR UPDATE;
+
+UPDATE payments
+SET status = 'succeeded', provider_reference = ?, paid_at = CURRENT_TIMESTAMP(6)
+WHERE id = ? AND status = 'pending';
+
+UPDATE produce_transactions
+SET status = 'paid'
+WHERE id = (
+    SELECT transaction_id FROM payments
+    WHERE id = ? AND status = 'succeeded'
+) AND status = 'pending_payment';
+
+INSERT INTO revenue_ledger
+    (id, payment_id, source_type, source_id, customer_user_id, amount, currency, description)
+SELECT ?, p.id, 'produce_commission', t.id, t.buyer_user_id,
+       t.commission_amount, t.currency, 'Produce transaction commission'
+FROM payments AS p
+JOIN produce_transactions AS t ON t.id = p.transaction_id
+WHERE p.id = ? AND p.status = 'succeeded' AND t.status = 'paid'
+ON DUPLICATE KEY UPDATE payment_id = payment_id;
+
+COMMIT;
+```
+
+Application code must verify the provider response and locked row before the updates. If any step fails, roll back. A duplicate webhook should confirm the existing succeeded payment and ledger state, then safely return success without re-fulfilling the order. The SQL sketch is not a complete provider webhook implementation.
+
+For a completed delivery, calculate the platform fee from the accepted transport quote and rate saved on the logistics request. Record the platform commission as revenue; track the carrier payout separately. A payout is not platform revenue.
+
+### Subscriptions
+
+- Resolve the plan price from `subscription_plans` on the server and snapshot it on the subscription/payment. Price changes must not rewrite earlier invoices.
+- A free plan does not produce paid revenue. Activate a paid plan only after verified payment success.
+- Specify renewals, failed renewals, grace periods, cancellation, refunds and proration before enabling recurring charges.
+- Process renewal attempts with server-side scheduled jobs and idempotency keys, never by relying on an open browser.
+
+### Revenue reporting
+
+Revenue is collected platform income only: successful commissions and paid service fees. Exclude gross produce value, carrier payout amounts, failed/pending payments and uncollected invoices.
+
+```sql
+SELECT source_type, currency, SUM(amount) AS platform_revenue
+FROM revenue_ledger
+WHERE created_at >= ? AND created_at < ?
+GROUP BY source_type, currency
+ORDER BY source_type;
+
+SELECT currency, SUM(amount) AS total_platform_revenue
+FROM revenue_ledger
+WHERE created_at >= ? AND created_at < ?
+GROUP BY currency;
+```
+
+Protect financial settings with admin authorization, validation (commission rates from 0 to 100), explicit confirmation and an `audit_logs` entry. Each order/delivery uses its saved commission rate, so setting changes affect new records only.
+
+## 7. Recommended PHP and MySQL project structure
+
+This is a target layout, not the current repository layout. The current prototype has root-level pages and browser scripts; add the PHP application separately, then migrate features to the API incrementally.
+
+```text
+agroconnect/
+├── public/                             # Web server document root
+│   ├── index.php                       # Front controller / router entry
+│   ├── index.html                      # Existing prototype page (during migration)
+│   ├── marketplace.html
+│   ├── farmers.html
+│   ├── buyer-requirements.html
+│   ├── opportunities.html
+│   ├── market-prices.html
+│   ├── register.html
+│   ├── login.html
+│   ├── farmer-dashboard.html
+│   ├── buyer-dashboard.html
+│   ├── organisation-dashboard.html
+│   ├── transport-dashboard.html
+│   ├── admin-dashboard.html
+│   ├── assets/
+│   │   ├── css/style.css
+│   │   ├── js/main.js
+│   │   └── js/business.js
+│   └── uploads/                        # Prefer private object storage instead
+├── src/
+│   ├── Bootstrap.php                   # Configuration and dependency wiring
+│   ├── Config/
+│   │   └── Database.php                # PDO connection factory
+│   ├── Middleware/
+│   │   ├── Authenticate.php
+│   │   ├── AuthorizeRole.php
+│   │   ├── Csrf.php
+│   │   └── ErrorHandler.php
+│   ├── Controllers/
+│   │   ├── AuthController.php
+│   │   ├── ListingController.php
+│   │   ├── OrderController.php
+│   │   ├── PaymentWebhookController.php
+│   │   ├── SubscriptionController.php
+│   │   ├── LogisticsController.php
+│   │   └── AdminController.php
+│   ├── Services/                       # Business rules and transactions
+│   ├── Repositories/                   # Prepared PDO queries
+│   ├── Validation/
+│   └── Support/
+├── routes/
+│   └── api.php                         # Route definitions
+├── database/
+│   ├── migrations/
+│   │   ├── 001_initial_schema.sql
+│   │   └── 002_...sql
+│   └── seeds/
+│       └── development.sql             # Fictional/test data only
+├── tests/
+│   ├── Unit/
+│   └── Integration/
+├── storage/
+│   └── logs/                           # Outside public web root
+├── docs/
+│   └── api.md
+├── vendor/                             # Composer dependencies (not committed)
+├── composer.json
+├── .env.example                        # Placeholder names only
+├── .gitignore
+└── datbase.readme
+```
+
+Configure Apache/Nginx so **only `public/` is web-accessible**. Keep `src/`, `.env`, SQL dumps, logs, Composer files and secrets outside the document root. Uploaded files should use private/object storage; do not commit real uploads or database data.
+
+Example `.env.example` (never put real secrets in it):
+
+```dotenv
+APP_ENV=local
+APP_DEBUG=true
+APP_URL=http://localhost
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=agroconnect
+DB_USERNAME=agroconnect_app
+DB_PASSWORD=replace-me
+PAYMENT_PROVIDER=replace-with-selected-provider
+PAYMENT_API_KEY=replace-me
+PAYMENT_WEBHOOK_SECRET=replace-me
+```
+
+Use an application database account with only required privileges; do not connect PHP as MySQL `root`. Add `.env`, `vendor/`, logs, SQL exports and user uploads to `.gitignore`.
+
+## 8. Build and launch checklist
+
+1. Keep the existing browser demo working while the PHP backend is built.
+2. Install PHP 8.2+, Composer and MySQL 8.0.16+ locally. Create a development database and a restricted application DB user.
+3. Apply the migration on a fresh database. Use migrations for all future schema changes; test both migrate and rollback procedures.
+4. Implement registration, verification, login, logout and password reset with PDO prepared statements, password hashing, secure sessions and role authorization.
+5. Add read-only public APIs for the homepage, produce, farmer directory, market prices and opportunities. Add pagination and field-level privacy.
+6. Implement each role workflow with server-side validation, ownership checks and explicit state transitions.
+7. Test commission math, rounding, authorization, duplicate requests, webhook retries, refunds, and concurrent inventory updates without real charges.
+8. Integrate a Ghana-compatible provider in test mode. Verify signed webhooks and test success, failure, cancellation, timeout, refund and duplicate delivery.
+9. Reconcile provider records, payments and ledger rows; account for carrier payouts separately.
+10. Before launch, configure HTTPS, secrets, database backups and restore drills, monitoring, rate limits, privacy/terms/refund policies, data retention and appropriate Ghanaian legal/data-protection guidance.
+
+### Essential tests
+
+- Duplicate normalized emails/phones are rejected; user/profile creation rolls back as a unit.
+- Passwords are hashed; invalid/suspended sessions fail; login is rate-limited; secrets are absent from logs.
+- Changing a URL, role field or user ID cannot access another user's data or admin/carrier functions.
+- A farmer cannot edit another farmer's listing; private contact details do not leak through public APIs.
+- Order price and commission are calculated by PHP from database values, not accepted from browser input.
+- GH₵10,000 at 3% yields GH₵300; GH₵1,000 at 10% yields GH₵100. Farmer payable is gross less commission.
+- Failed or pending payments create no paid revenue. A verified success webhook creates one revenue row even when delivered repeatedly.
+- Refunds preserve the original payment and ledger history and add an auditable correction.
+- Only the assigned transport operator can advance a delivery; platform commission differs from carrier payout.
+- Admin setting changes are validated/audited and affect new transactions only.
+- Migration and seed scripts run cleanly on a fresh MySQL 8.0.16+ database using strict SQL mode.
+
+## 9. Current prototype limitations
+
+The current site is static HTML with browser-side `data.js`, `main.js`, and `business.js`. `business.js` persists demo data in `localStorage` under `agroBusinessState`. It does not use PHP, MySQL, real authentication, a backend, or a payment provider. All sample prices, profiles, transactions and payment outcomes are illustrative. Follow `README.md` to run the present prototype; this document describes the separate PHP/MySQL backend you need to build.
